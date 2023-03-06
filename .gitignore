@@ -151,3 +151,5 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 test_data.json
+docusign_private_key.pem
+at-api-hub-d1ddd021ac28.json
