@@ -16,48 +16,40 @@ logging_client = google.cloud.logging.Client() if not os.path.exists(
 logging_client.setup_logging()
 
 
-def send_document_to_ghl(request_json):
+def send_document_to_ghl_contact(request_json):
     try:
-        contact_email = request_json['data']['envelopeSummary']['recipients']['signers'][0]['email']
+        docusign_envelope_signers = request_json['data']['envelopeSummary']['recipients']['signers']
     except KeyError as e:
         return log_error(traceback.format_exc(), request_json)
-    location_api_key = os.environ.get("LOCATION_KEY")
-    ghl_headers = {
-        "Authorization": f"Bearer {location_api_key}"
-    }
-    contact_data = find_contact(ghl_headers, contact_email)
-    if contact_data is None:
-        return log_info(
-            "Contact does not exist in GHL", request_json
-        )
-    custom_fields = get_custom_fields(ghl_headers)
-    contact_id = contact_data['id']
-    target_field_id = get_document_field_id(custom_fields)
-    if target_field_id == '':
-        raise Exception(
-            "Signed Document URL field has not been created"
-        )
-    jwt_token = generate_jwt_token()
-    access_token = get_access_token(jwt_token)
-    user_info = get_user_info(access_token['access_token'])
-    document_content = download_doc(
-        user_info['accounts'][0]['base_uri'],
-        user_info['accounts'][0]['account_id'],
-        request_json['data']['envelopeId'],
-        access_token['access_token']
-    )
+    # DocuSign
+    docusign_envelope_id = request_json['data']['envelopeId']
+    docusign_document_content = get_docusign_document_content(
+        docusign_envelope_id)
+    # GCS
     gcs_download_url = write_to_gcs(
-        document_content, request_json['data']['envelopeId'])
-    custom_value = json.dumps({
-        "customField": {
-            target_field_id: gcs_download_url
-        }
-    })
-    try:
-        response = update_contact(ghl_headers, contact_id, custom_value)
-        log_info("Contact updated successfully", response.json())
-    except Exception as e:
-        return log_error(traceback.format_exc(), request_json)
+        docusign_document_content, docusign_envelope_id)
+    # GHL
+    ghl_location_api_key = os.environ.get("LOCATION_KEY")
+    ghl_headers = {
+        "Authorization": f"Bearer {ghl_location_api_key}"
+    }
+    ghl_custom_value_payload = generate_ghl_contact_payload(
+        ghl_headers, gcs_download_url)
+    for signer in docusign_envelope_signers:
+        signer_email = signer['email']
+        ghl_contact_data = find_ghl_contact(ghl_headers, signer_email)
+        if ghl_contact_data is None:
+            log_info(
+                "Contact does not exist in GHL", request_json
+            )
+            continue
+        ghl_contact_id = ghl_contact_data['id']
+        try:
+            response = update_ghl_contact(
+                ghl_headers, ghl_contact_id, ghl_custom_value_payload)
+            log_info("Contact updated successfully", response.json())
+        except Exception as e:
+            return log_error(traceback.format_exc(), request_json)
 
 
 @functions_framework.http
@@ -69,7 +61,7 @@ def docusign_webhook(request):
         action = request.args.get('action')
         if action == 'send_to_ghl':
             try:
-                send_document_to_ghl(request_json)
+                send_document_to_ghl_contact(request_json)
             except Exception as e:
                 return log_error(traceback.format_exc(), request_json)
     return "OK"
@@ -97,7 +89,22 @@ def log_info(msg, request):
     return "OK"
 
 
-def find_contact(ghl_headers, email):
+def generate_ghl_contact_payload(ghl_headers, gcs_download_url):
+    ghl_custom_fields = get_ghl_custom_fields(ghl_headers)
+    ghl_target_custom_field_id = set_document_field_id(ghl_custom_fields)
+    if ghl_target_custom_field_id == '':
+        raise Exception(
+            "Signed Document URL field has not been created"
+        )
+    ghl_custom_value_payload = json.dumps({
+        "customField": {
+            ghl_target_custom_field_id: gcs_download_url
+        }
+    })
+    return ghl_custom_value_payload
+
+
+def find_ghl_contact(ghl_headers, email):
     contact_lookup_ep = f"https://rest.gohighlevel.com/v1/contacts/lookup?email={email}"
     response = requests.get(contact_lookup_ep, headers=ghl_headers)
     if response.status_code != 200:
@@ -105,7 +112,7 @@ def find_contact(ghl_headers, email):
     return response.json()['contacts'][0]
 
 
-def get_custom_fields(ghl_headers):
+def get_ghl_custom_fields(ghl_headers):
     custom_fields_ep = "https://rest.gohighlevel.com/v1/custom-fields/"
     response = requests.get(custom_fields_ep, headers=ghl_headers)
     if response.status_code != 200:
@@ -113,7 +120,7 @@ def get_custom_fields(ghl_headers):
     return response.json()['customFields']
 
 
-def get_document_field_id(custom_fields):
+def set_document_field_id(custom_fields):
     field_unique_key = os.environ.get("FIELD_KEY")
     field_id = ''
     for field in custom_fields:
@@ -123,7 +130,7 @@ def get_document_field_id(custom_fields):
     return field_id
 
 
-def update_contact(ghl_headers, contact_id, custom_value):
+def update_ghl_contact(ghl_headers, contact_id, custom_value):
     contact_update_ep = f"https://rest.gohighlevel.com/v1/contacts/{contact_id}"
     ghl_headers['Content-Type'] = 'application/json'
     response = requests.put(
@@ -136,7 +143,7 @@ def update_contact(ghl_headers, contact_id, custom_value):
     return response
 
 
-def generate_jwt_token():
+def generate_docusign_jwt_token():
     algorithm = "RS256"
     payload = {
         "iss": os.environ.get("INTEGRATION_KEY"),
@@ -160,7 +167,21 @@ def generate_jwt_token():
     return jwt_token
 
 
-def get_access_token(jwt_token):
+def get_docusign_document_content(docusign_envelope_id):
+    docusign_jwt_token = generate_docusign_jwt_token()
+    docusign_access_token = get_docusign_access_token(docusign_jwt_token)
+    docusign_user_info = get_docusign_user_info(
+        docusign_access_token['access_token'])
+    docusign_document_content = download_docusign_document(
+        docusign_user_info['accounts'][0]['base_uri'],
+        docusign_user_info['accounts'][0]['account_id'],
+        docusign_envelope_id,
+        docusign_access_token['access_token']
+    )
+    return docusign_document_content
+
+
+def get_docusign_access_token(jwt_token):
     access_token_ep = 'https://' + os.environ.get("BASE_URL") + "/oauth/token"
     form_data = {
         "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
@@ -172,7 +193,7 @@ def get_access_token(jwt_token):
     return response.json()
 
 
-def get_user_info(access_token):
+def get_docusign_user_info(access_token):
     user_info_ep = 'https://' + os.environ.get("BASE_URL") + "/oauth/userinfo"
     headers = {
         "Authorization": f"Bearer {access_token}"
@@ -183,7 +204,7 @@ def get_user_info(access_token):
     return response.json()
 
 
-def download_doc(base_uri, account_id, envelope_id, access_token):
+def download_docusign_document(base_uri, account_id, envelope_id, access_token):
     document_download_ep = f"{base_uri}/restapi/v2.1/accounts/{account_id}/envelopes/{envelope_id}/documents/combined"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -196,15 +217,10 @@ def download_doc(base_uri, account_id, envelope_id, access_token):
     return response.content
 
 
-def set_storage_client():
-    if os.path.exists(service_account_credentials):
-        return storage.Client().from_service_account_json(
-            service_account_credentials)
-    return storage.Client()
-
-
 def write_to_gcs(content, envelope_id):
-    storage_client = set_storage_client()
+    storage_client = storage.Client() if not os.path.exists(
+        service_account_credentials) else storage.Client().from_service_account_json(
+            service_account_credentials)
     bucket = storage_client.bucket(os.environ.get("BUCKET_NAME"))
     blob_name = f"{envelope_id}.pdf"
     blob = bucket.blob(blob_name)
@@ -216,4 +232,4 @@ def write_to_gcs(content, envelope_id):
 if __name__ == "__main__":
     with open('test_data.json') as file:
         test_data = json.loads(file.read())
-    send_document_to_ghl(test_data)
+    send_document_to_ghl_contact(test_data)
